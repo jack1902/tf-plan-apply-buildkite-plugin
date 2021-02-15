@@ -1,0 +1,10 @@
+name: Run CI Testing & Linting
+on:
+  [push]
+jobs:
+  Linting:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - name: Run Buildkite Plugin Linter
+        run: docker-compose run --rm buildkite_plugin_linter
