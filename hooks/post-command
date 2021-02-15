@@ -1,0 +1,12 @@
+#!/bin/bash
+
+set -eou pipefail
+
+function cleanup() {
+  local TERRAFORM_DIRECTORY="${BUILDKITE_PLUGIN_TERRAFORM_TERRAFORM_DIRECTORY:-false}"
+  echo "--- :terraform: Cleaning Up"
+
+  rm -rf .terraform "terraform-*.plan"
+}
+
+cleanup

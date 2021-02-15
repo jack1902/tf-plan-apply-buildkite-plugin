@@ -1,0 +1,10 @@
+---
+version: "3"
+services:
+  buildkite_plugin_linter:
+    image: buildkite/plugin-linter
+    command: [
+      --id, ssh://git@github.com/jack1902/tf-plan-apply-buildkite-plugin.git
+    ]
+    volumes:
+      - .:/plugin

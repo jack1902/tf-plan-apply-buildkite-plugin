@@ -1,0 +1,236 @@
+#!/bin/bash
+
+set -eou pipefail
+
+KNOWN_HOSTS_FILE="$(pwd)/known_hosts"
+
+if [[ ! -f "${KNOWN_HOSTS_FILE}" ]]; then
+  ssh-keyscan github.com >> "${KNOWN_HOSTS_FILE}"
+fi
+
+
+#############
+# FUNCTIONS #
+#############
+
+# Reads either a value or a list from plugin config
+function plugin_read_list() {
+  prefix_read_list "BUILDKITE_PLUGIN_TF_PLAN_APPLY_$1"
+}
+
+# Reads either a value or a list from the given env prefix
+function prefix_read_list() {
+  local prefix="${1}"
+  local parameter="${prefix}_0"
+
+  if [[ -n "${!parameter:-}" ]]; then
+    local i=0
+    local parameter="${prefix}_${i}"
+    while [[ -n "${!parameter:-}" ]]; do
+      echo "${!parameter}"
+      i=$((i + 1))
+      parameter="${prefix}_${i}"
+    done
+  elif [[ -n "${!prefix:-}" ]]; then
+    echo "${!prefix}"
+  fi
+}
+
+function terraform-bin() {
+  local DOCKER_IMAGE="${IMAGE_NAME}:${VERSION}"
+
+  docker_args=()
+
+  docker_args+=(
+    "--rm"
+    "-it"
+    "-e" "SSH_AUTH_SOCK"
+    "-v" "${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}"
+    "-v" "${PWD}:/svc"
+    "-v" "${KNOWN_HOSTS_FILE}:/root/.ssh/known_hosts"
+    # Used to ensure cleanup can function
+    "-u" "$(id -u):$(id -g)"
+    "-v" "/etc/passwd:/etc/passwd:ro"
+    "-v" "/etc/group:/etc/group:ro"
+    "-v" "/etc/shadow:/etc/shadow:ro"
+  )
+
+  extra_envs=()
+  while read -r line; do
+    [[ -n "${line}" ]] && extra_envs+=("${line}")
+  done <<< "$(plugin_read_list ENV)"
+
+  # shellcheck disable=SC2068
+  for e in ${extra_envs[@]-}; do
+    docker_args+=("--env" "${e}")
+  done
+
+  extra_volumes=()
+  while read -r line; do
+    [[ -n "${line}" ]] && extra_volumes+=("${line}")
+  done <<< "$(plugin_read_list VOLUMES)"
+
+  # shellcheck disable=SC2068
+  for v in ${extra_volumes[@]-}; do
+    docker_args+=("-v" "${v}")
+  done
+
+  docker_args+=(
+    "-w" "/svc"
+    "${DOCKER_IMAGE}"
+    "${@}"
+  )
+
+  if [[ "${DEBUG}" == true ]]; then
+    echo "--- :terraform: :buildkite: :hammer_and_wrench: Debug on - show Docker command string."
+    echo "docker run $(printf "%q " "${docker_args[@]}")"
+  fi
+
+  # shellcheck disable=SC2046
+  docker run $(printf "%q " "${docker_args[@]}")
+}
+
+function no_changes() {
+  echo "+++ :terraform: No Changes!"
+  buildkite-agent annotate --style success --context "${_WORKSPACE}" ":terraform: No Changes detected for ${_WORKSPACE}!"
+  exit
+}
+
+function changes() {
+  echo "+++ :terraform: Changes detected!"
+  buildkite-agent annotate --style warning --context "${_WORKSPACE}" ":terraform: Changes detected for ${_WORKSPACE}!"
+}
+
+function terraform-run() {
+  local DEBUG="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_DEBUG:-false}"
+  local ACTION="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_ACTION:-plan}" # Can be `plan` `block_apply` `apply_plan`
+  local WORKSPACE="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_WORKSPACE:-default}"
+  local TERRAFORM_DIRECTORY="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_TERRAFORM_DIRECTORY:-false}"
+  local VAR_FILE="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_VAR_FILE:-false}"
+  local IMAGE_NAME="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_IMAGE:-hashicorp/terraform}"
+  local VERSION="${BUILDKITE_PLUGIN_TF_PLAN_APPLY_VERSION:-0.14.5}"
+  local VALIDATE=${BUILDKITE_PLUGIN_TF_PLAN_APPLY_VALIDATE:-true}
+
+  if [[ "${DEBUG}" == true ]]; then
+    echo "--- :terraform: :buildkite: :hammer_and_wrench: Debug on - list local variables."
+    echo "ACTION: ${ACTION}"
+    echo "WORKSPACE: ${WORKSPACE}"
+    echo "TERRAFORM_DIRECTORY: ${TERRAFORM_DIRECTORY}"
+    echo "VAR_FILE: ${VAR_FILE}"
+    echo "IMAGE_NAME: ${IMAGE_NAME}"
+    echo "VERSION: ${VERSION}"
+    echo "VALIDATE: ${VALIDATE}"
+  fi
+
+  # Ensure we are in the right directory from the get go
+  if [[ "${TERRAFORM_DIRECTORY}" == false ]]; then
+    _WORKSPACE="${WORKSPACE}"
+  else
+    cd "${TERRAFORM_DIRECTORY}"
+    _WORKSPACE="${WORKSPACE}-$(echo "${TERRAFORM_DIRECTORY}" | tr "/" "-")"
+  fi
+
+  PLAN_FILE="terraform-${_WORKSPACE}.tfplan"
+
+  # Initialize terraform
+  echo "+++ :terraform: :buildkite: :hammer_and_wrench: Setting up Terraform environment..."
+  terraform-bin init -input=false
+  echo ""
+
+  # Set the workspace if they are being used
+  if [[ "${WORKSPACE}" != "default" ]]; then
+    echo "+++ :terraform: Setting the terraform workspace ${WORKSPACE}"
+    terraform-bin workspace select "${WORKSPACE}"
+    echo ""
+  fi
+
+  if [[ "${VALIDATE}" == true ]]; then
+    echo "+++ :terraform: running terraform validate"
+    terraform-bin validate
+  fi
+
+  case ${ACTION} in
+
+    plan)
+      echo "+++ :terraform: Running terraform plan ONLY"
+      set +e
+      if [[ "${VAR_FILE}" == false ]]; then
+        terraform-bin plan -input=false -detailed-exitcode
+      else
+        terraform-bin plan -input=false -var-file="${VAR_FILE}" -detailed-exitcode
+      fi
+      exit_code="${?}"
+      set -e
+
+      if [[ "${exit_code}" == "0" ]]; then
+        no_changes
+      elif [[ "${exit_code}" == "2" ]]; then
+        changes
+      else
+        echo "+++ :terraform: Error occurred"
+        exit "${exit_code}"
+      fi
+    ;;
+
+    block_apply)
+      echo "+++ :terraform: Running plan to check for diff"
+      set +e
+      if [[ "${VAR_FILE}" == false ]]; then
+        terraform-bin plan -input=false -out="${PLAN_FILE}" -detailed-exitcode
+      else
+        terraform-bin plan -input=false -out="${PLAN_FILE}" -var-file="${VAR_FILE}" -detailed-exitcode
+      fi
+      exit_code="${?}"
+      echo ""
+      set -e
+
+      if [[ "${exit_code}" == "0" ]]; then
+        no_changes
+      elif [[ "${exit_code}" == "2" ]]; then
+        changes
+	      buildkite-agent artifact upload "${PLAN_FILE}"
+
+        # Attempt to redownload it :/
+        buildkite-agent artifact download "${PLAN_FILE}" .
+
+        # Upload the block/apply plan steps
+        cat <<EOF | buildkite-agent pipeline upload
+- block: "Apply ${_WORKSPACE}?"
+  branches: "main master"
+  key: "apply-${_WORKSPACE}"
+
+- label: ":terraform: Applying previous plan"
+  depends_on: "apply-${_WORKSPACE}"
+  branches: "main master"
+  plugins:
+    - ssh://git@github.com/jack1902/tf-plan-apply-buildkite-plugin.git#v0.0.1:
+        version: "${VERSION}"
+        action: apply_plan
+        terraform_directory: "${TERRAFORM_DIRECTORY}"
+        workspace: "${WORKSPACE}"
+        image_name: "${IMAGE_NAME}"
+        debug: "${DEBUG}"
+        validate: false
+  agents:
+    queue: ${BUILDKITE_AGENT_META_DATA_QUEUE}
+EOF
+      else
+        echo "+++ :terraform: Error occurred"
+        exit "${exit_code}"
+      fi
+    ;;
+
+    apply_plan)
+      echo "+++ Running terraform apply against the previous plan"
+      buildkite-agent artifact download "${PLAN_FILE}" .
+      terraform-bin apply -input=false "${PLAN_FILE}"
+    ;;
+
+    *)
+      echo "+++ :terraform: Unknown action: ${ACTION}"
+      exit 1
+    ;;
+  esac
+}
+
+terraform-run

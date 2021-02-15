@@ -1,0 +1,30 @@
+name: tf plan apply
+description: Runs terraform using docker and enables a controlled apply
+author: https://github.com/jack1902
+requirements:
+  - docker
+configuration:
+  properties:
+    debug:
+      type: boolean
+    action:
+      type: string
+    workspace:
+      type: string
+    terraform_directory:
+      type: string
+    var_file:
+      type: string
+    image_name:
+      type: string
+    version:
+      type: string
+    validate:
+      type: boolean
+    env:
+      type: [string, array]
+    volumes:
+      type: [string, array]
+  required:
+    - action
+    - version
